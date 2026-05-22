@@ -255,13 +255,49 @@ async def _split_dialogues_impl_async(client: AsyncOpenAI, text: str, chapter_ti
     async def process_chunk(i: int, chunk: str) -> List[DialogueLine]:
         async with semaphore:
             chunk_id = f"{chapter_title}_chunk{i:03d}"
-            print(f"    ⏳ 开始处理块{i+1}/{len(chunks)}...")
+            start_time = time.strftime("%H:%M:%S")
+            print(f"    ⏳ [{start_time}] 块{i+1}/{len(chunks)} 开始处理 ({len(chunk)}字)")
             result = await _split_single_chunk_async(client, chunk, chunk_id, book_name, chapter_title, current_character_map)
-            print(f"    ✅ 块{i+1}处理完成: {len(result)}段")
+            end_time = time.strftime("%H:%M:%S")
+            print(f"    ✅ [{end_time}] 块{i+1}/{len(chunks)} 处理完成: {len(result)}段")
             return result
 
-    tasks = [process_chunk(i, chunk) for i, chunk in enumerate(chunks)]
+    # 记录每个块的时间
+    chunk_times = {}
+
+    async def process_chunk_with_time(i: int, chunk: str) -> List[DialogueLine]:
+        async with semaphore:
+            chunk_id = f"{chapter_title}_chunk{i:03d}"
+            start_time = time.time()
+            start_str = time.strftime("%H:%M:%S")
+            print(f"    ⏳ [{start_str}] 块{i+1}/{len(chunks)} 开始处理 ({len(chunk)}字)")
+            result = await _split_single_chunk_async(client, chunk, chunk_id, book_name, chapter_title, current_character_map)
+            end_time = time.time()
+            end_str = time.strftime("%H:%M:%S")
+            elapsed = end_time - start_time
+            chunk_times[i] = {"start": start_str, "end": end_str, "elapsed": elapsed}
+            print(f"    ✅ [{end_str}] 块{i+1}/{len(chunks)} 处理完成: {len(result)}段 (耗时{elapsed:.1f}秒)")
+            return result
+
+    overall_start = time.time()
+    tasks = [process_chunk_with_time(i, chunk) for i, chunk in enumerate(chunks)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    overall_elapsed = time.time() - overall_start
+
+    # 打印并行情况汇总
+    if len(chunks) > 1:
+        print(f"\n    📊 并行处理汇总 (总耗时{overall_elapsed:.1f}秒):")
+        print(f"    {'块':>4} | {'开始时间':>8} | {'结束时间':>8} | {'耗时':>6}")
+        print(f"    {'----':>4} | {'--------':>8} | {'--------':>8} | {'------':>6}")
+        for i in range(len(chunks)):
+            if i in chunk_times:
+                t = chunk_times[i]
+                print(f"    {i+1:>4} | {t['start']:>8} | {t['end']:>8} | {t['elapsed']:>5.1f}s")
+        # 计算并行效率
+        sum_elapsed = sum(t['elapsed'] for t in chunk_times.values())
+        if sum_elapsed > 0:
+            parallel_ratio = overall_elapsed / sum_elapsed * 100
+            print(f"    并行效率: {parallel_ratio:.0f}% (越低越好, 100%表示完全串行)")
 
     all_lines = []
     for i, result in enumerate(results):
