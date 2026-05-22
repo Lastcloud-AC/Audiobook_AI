@@ -31,6 +31,7 @@ from modules.audio_processor import (
     get_wav_duration, merge_wav_files, split_audio_by_duration,
     create_silence, format_duration
 )
+from modules.coverage_analyzer import analyze_coverage, print_coverage_report, print_summary
 
 
 @dataclass
@@ -597,6 +598,76 @@ async def main():
         chapters = _filter_chapters_content(chapters, args.first_paragraphs, args.first_chars)
 
     # ============================================================
+    # 交互式选择：让用户选择要处理的章节
+    # ============================================================
+    from modules.dialogue_splitter import _split_text_chunks
+
+    print(f"\n📋 章节列表:")
+    for i, chapter in enumerate(chapters, 1):
+        print(f"  {i}. {chapter.title} ({len(chapter.text)}字)")
+
+    if len(chapters) == 1:
+        # 没有章节标题，让用户输入块数
+        chunk_size = config.generation.chunk_size
+        all_chunks = _split_text_chunks(chapters[0].text, chunk_size)
+        print(f"\n  检测到没有章节标题")
+        print(f"  按{chunk_size}字分块，共{len(all_chunks)}块")
+        print(f"  请输入要处理的块数（例如：2，直接回车处理全部）:")
+
+        user_input = input("  > ").strip()
+        if user_input:
+            try:
+                num_chunks = int(user_input)
+                if num_chunks < 1:
+                    print("❌ 块数必须大于0")
+                    return
+                # 取前N块
+                selected_chunks = all_chunks[:num_chunks]
+                print(f"\n  ✅ 选择处理前{num_chunks}块")
+                for i, chunk in enumerate(selected_chunks, 1):
+                    print(f"    块{i}: {len(chunk)}字")
+            except ValueError:
+                print("❌ 请输入有效的数字")
+                return
+        else:
+            selected_chunks = all_chunks
+            print(f"\n  ✅ 处理全部{len(selected_chunks)}块")
+
+        # 每块作为独立章节处理
+        from modules.novel_reader import Chapter
+        chapters = []
+        for i, chunk in enumerate(selected_chunks, 1):
+            chapters.append(Chapter(
+                number=i,
+                title=f"块{i}",
+                text=chunk
+            ))
+    else:
+        # 有章节，让用户选择章节
+        print(f"\n  检测到{len(chapters)}个章节")
+        print(f"  请输入要处理的章节号（例如：2,3,4,6，直接回车处理全部）:")
+
+        user_input = input("  > ").strip()
+        if user_input:
+            try:
+                chapter_indices = [int(x.strip()) for x in user_input.split(",")]
+                # 验证章节号
+                for idx in chapter_indices:
+                    if idx < 1 or idx > len(chapters):
+                        print(f"❌ 章节号 {idx} 无效，有效范围: 1-{len(chapters)}")
+                        return
+                # 筛选章节
+                chapters = [chapters[i-1] for i in chapter_indices]
+                print(f"\n  ✅ 选择处理{len(chapters)}个章节")
+                for i, chapter in enumerate(chapters, 1):
+                    print(f"    {i}. {chapter.title} ({len(chapter.text)}字)")
+            except ValueError:
+                print("❌ 请输入有效的章节号（用逗号分隔）")
+                return
+        else:
+            print(f"\n  ✅ 处理全部{len(chapters)}个章节")
+
+    # ============================================================
     # 阶段1: LLM分割
     # ============================================================
     success_results, failed_results = await split_all_chapters(chapters, book_name, config)
@@ -616,6 +687,26 @@ async def main():
         print(f"\n🎭 全局人物映射表:")
         for char, voice in character_map.items():
             print(f"   {char} -> {voice}")
+
+    # ============================================================
+    # 覆盖率分析
+    # ============================================================
+    print(f"\n{'='*60}")
+    print(f"  覆盖率详细分析")
+    print(f"{'='*60}")
+
+    coverage_reports = []
+    for result in success_results:
+        report = analyze_coverage(
+            original_text=result.chapter.text,
+            lines=result.lines,
+            chapter_title=result.chapter.title
+        )
+        coverage_reports.append(report)
+        print_coverage_report(report, verbose=(report.coverage < 0.9))
+
+    # 打印汇总
+    print_summary(coverage_reports)
 
     # 如果只分割不生成
     if args.split_only:

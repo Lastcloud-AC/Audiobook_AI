@@ -240,6 +240,12 @@ async def _split_dialogues_impl_async(client: AsyncOpenAI, text: str, chapter_ti
     config = get_config()
     chunks = _split_text_chunks(text, config.generation.chunk_size)
 
+    # 显示分块信息
+    if len(chunks) > 1:
+        print(f"    📦 分为{len(chunks)}块处理:")
+        for i, chunk in enumerate(chunks):
+            print(f"       块{i+1}: {len(chunk)}字")
+
     # 获取当前全局人物映射
     current_character_map = get_global_character_map()
 
@@ -249,7 +255,10 @@ async def _split_dialogues_impl_async(client: AsyncOpenAI, text: str, chapter_ti
     async def process_chunk(i: int, chunk: str) -> List[DialogueLine]:
         async with semaphore:
             chunk_id = f"{chapter_title}_chunk{i:03d}"
-            return await _split_single_chunk_async(client, chunk, chunk_id, book_name, chapter_title, current_character_map)
+            print(f"    ⏳ 开始处理块{i+1}/{len(chunks)}...")
+            result = await _split_single_chunk_async(client, chunk, chunk_id, book_name, chapter_title, current_character_map)
+            print(f"    ✅ 块{i+1}处理完成: {len(result)}段")
+            return result
 
     tasks = [process_chunk(i, chunk) for i, chunk in enumerate(chunks)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -257,7 +266,7 @@ async def _split_dialogues_impl_async(client: AsyncOpenAI, text: str, chapter_ti
     all_lines = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"    ❌ Chunk {i} 处理失败: {result}")
+            print(f"    ❌ 块{i+1}处理失败: {result}")
             # 使用fallback分割
             all_lines.extend(_fallback_split(chunks[i]))
         else:
@@ -267,24 +276,50 @@ async def _split_dialogues_impl_async(client: AsyncOpenAI, text: str, chapter_ti
 
 
 def _split_text_chunks(text: str, chunk_size: int) -> List[str]:
-    """将文本分割成chunks"""
+    """
+    将文本分割成chunks
+    
+    逻辑：
+    1. 在chunk_size位置往前找100个字符内的\n\n
+    2. 找不到\n\n就找离chunk_size往前最近的\n
+    3. 确保每个块都不超过chunk_size，且尽可能接近chunk_size
+    """
     if len(text) <= chunk_size:
         return [text]
 
-    paragraphs = text.split('\n\n')
     chunks = []
-    current_chunk = []
-
-    for para in paragraphs:
-        if len('\n\n'.join(current_chunk + [para])) > chunk_size and current_chunk:
-            chunks.append('\n\n'.join(current_chunk))
-            current_chunk = [para]
+    start = 0
+    
+    while start < len(text):
+        # 如果剩余文本不超过chunk_size，直接作为一个块
+        if start + chunk_size >= len(text):
+            chunks.append(text[start:])
+            break
+        
+        # 在chunk_size位置往前找分块点
+        end = start + chunk_size
+        
+        # 1. 先找100个字符内的\n\n
+        search_start = max(start, end - 100)
+        newline_pos = text.rfind('\n\n', search_start, end)
+        
+        if newline_pos > start:
+            # 找到了\n\n，在这个位置分块
+            chunks.append(text[start:newline_pos])
+            start = newline_pos + 2  # 跳过\n\n
         else:
-            current_chunk.append(para)
-
-    if current_chunk:
-        chunks.append('\n\n'.join(current_chunk))
-
+            # 2. 找不到\n\n，找离chunk_size往前最近的\n
+            newline_pos = text.rfind('\n', start, end)
+            
+            if newline_pos > start:
+                # 找到了\n，在这个位置分块
+                chunks.append(text[start:newline_pos])
+                start = newline_pos + 1  # 跳过\n
+            else:
+                # 3. 都找不到，强制在chunk_size位置分块
+                chunks.append(text[start:end])
+                start = end
+    
     return chunks
 
 
@@ -467,6 +502,11 @@ async def _try_simplified_prompt_async(client: AsyncOpenAI, text: str, chapter_t
         
         raw_response = response.choices[0].message.content.strip()
         print(f"    简化prompt重试: 收到响应({len(raw_response)}字)")
+        
+        # 检查内容审核拒绝
+        if is_content_moderation_error(raw_response):
+            print(f"    ✗ 简化prompt重试也被内容审核拒绝")
+            return None
         
         # 解析响应
         lines = _parse_llm_response(raw_response, text)
@@ -930,6 +970,13 @@ def _recursive_split_by_moderation(
 
     # 构建提示词
     prompt = config.config.get("split_prompt", "").replace("{text}", text)
+    # 替换角色映射占位符
+    character_map = get_global_character_map()
+    if character_map:
+        character_map_str = "\n".join([f"- {name}: {voice}" for name, voice in character_map.items()])
+    else:
+        character_map_str = "（暂无已知角色）"
+    prompt = prompt.replace("{character_map}", character_map_str)
     chunk_id = f"{chunk_prefix}_d{depth}"
 
     # 重试配置
@@ -1024,76 +1071,119 @@ async def _recursive_split_by_moderation_async(
 
     # 构建提示词
     prompt = config.config.get("split_prompt", "").replace("{text}", text)
+    # 替换角色映射占位符
+    character_map = get_global_character_map()
+    if character_map:
+        character_map_str = "\n".join([f"- {name}: {voice}" for name, voice in character_map.items()])
+    else:
+        character_map_str = "（暂无已知角色）"
+    prompt = prompt.replace("{character_map}", character_map_str)
     chunk_id = f"{chunk_prefix}_d{depth}"
     rate_limiter = get_llm_rate_limiter()
 
     # 重试配置
     max_api_retries = 3  # API调用异常最大重试次数
-    max_parse_retries = 1  # JSON解析/覆盖率失败最大重试次数
+    max_coverage_retries = 1  # 覆盖率失败最大重试次数
 
-    # API调用异常重试循环
-    for api_attempt in range(max_api_retries):
+    # 重试计数器
+    api_error_count = 0  # API异常次数
+    coverage_fail_count = 0  # 覆盖率失败次数
+
+    # 计时统计
+    total_rate_limit_time = 0
+    total_api_time = 0
+    total_parse_time = 0
+
+    # API调用重试循环（最多调用 max_api_retries + max_coverage_retries 次）
+    total_attempts = max_api_retries + max_coverage_retries
+    for attempt in range(total_attempts):
         try:
             # 等待速率限制
+            t0 = time.time()
             await rate_limiter.acquire()
+            rate_limit_time = time.time() - t0
+            total_rate_limit_time += rate_limit_time
+            if rate_limit_time > 0.1:
+                print(f"  {'  ' * depth}⏱ 速率限制等待: {rate_limit_time:.2f}秒")
 
-            response = await client.chat.completions.create(
-                model=config.llm_api.model,
-                messages=[
-                    {"role": "system", "content": "你是一个JSON输出助手，只输出JSON数组，不要其他内容。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3
+            # API调用
+            t0 = time.time()
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=config.llm_api.model,
+                    messages=[
+                        {"role": "system", "content": "你是一个JSON输出助手，只输出JSON数组，不要其他内容。"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3
+                ),
+                timeout=120  # 120秒超时（API响应较慢）
             )
+            api_time = time.time() - t0
+            total_api_time += api_time
+            print(f"  {'  ' * depth}⏱ API调用: {api_time:.2f}秒")
 
             raw_response = response.choices[0].message.content.strip()
 
-            # 检查内容审核拒绝
+            # 检查内容审核拒绝 → 直接对半拆分，不重试（内容有问题，重试没用）
             if is_content_moderation_error(raw_response):
-                print(f"  {'  ' * depth}⚠ 内容审核拒绝(深度{depth})，对半拆分处理...")
+                print(f"  {'  ' * depth}⚠ 内容审核拒绝(深度{depth})，直接对半拆分处理...")
                 _save_llm_response(chunk_id, raw_response, book_name, chapter_title, error="content_moderation_rejected")
                 return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
 
             # 保存原始响应
             _save_llm_response(chunk_id, raw_response, book_name, chapter_title)
 
-            # JSON解析/覆盖率重试循环
-            for parse_attempt in range(max_parse_retries + 1):
-                # 解析响应
-                lines = _parse_llm_response(raw_response, text)
+            # 解析响应
+            t0 = time.time()
+            lines = _parse_llm_response(raw_response, text)
+            parse_time = time.time() - t0
+            total_parse_time += parse_time
+            print(f"  {'  ' * depth}⏱ 解析响应: {parse_time:.3f}秒, 生成{len(lines)}段")
 
-                # 验证覆盖率
-                coverage = _verify_coverage(text, lines)
-                if coverage >= 0.7:
-                    return lines
+            # 验证覆盖率
+            coverage = _verify_coverage(text, lines)
+            if coverage >= 0.7:
+                print(f"  {'  ' * depth}✅ 覆盖率通过: {coverage:.1%}")
+                print(f"  {'  ' * depth}📊 时间统计 - 速率限制: {total_rate_limit_time:.2f}秒, API调用: {total_api_time:.2f}秒, 解析: {total_parse_time:.3f}秒")
+                return lines
 
-                # 覆盖率过低，判断是否重试
-                if parse_attempt < max_parse_retries:
-                    print(f"  {'  ' * depth}⚠ 覆盖率过低({coverage:.1%})，重试解析({parse_attempt + 1}/{max_parse_retries})...")
-                    continue
-                else:
-                    print(f"  {'  ' * depth}⚠ 覆盖率过低({coverage:.1%})，已达重试上限，尝试简化prompt重试...")
-                    # 简化prompt重试
-                    simplified_result = await _try_simplified_prompt_async(client, text, chapter_title, chunk_id, book_name)
-                    if simplified_result:
-                        return simplified_result
-                    print(f"  {'  ' * depth}⚠ 简化prompt重试失败，使用fallback分割")
-                    return _fallback_split(text)
+            # 覆盖率过低，判断是否重试（只重试1次，重新调用API）
+            coverage_fail_count += 1
+            if coverage_fail_count <= max_coverage_retries:
+                print(f"  {'  ' * depth}⚠ 覆盖率过低({coverage:.1%})，重新调用API重试({coverage_fail_count}/{max_coverage_retries})...")
+                continue
+            else:
+                # 覆盖率重试都失败，对半拆分递归
+                print(f"  {'  ' * depth}⚠ 覆盖率过低({coverage:.1%})，重试{max_coverage_retries}次都失败，对半拆分递归处理...")
+                print(f"  {'  ' * depth}📊 时间统计 - 速率限制: {total_rate_limit_time:.2f}秒, API调用: {total_api_time:.2f}秒, 解析: {total_parse_time:.3f}秒")
+                return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
 
-        except Exception as e:
-            if api_attempt < max_api_retries - 1:
-                wait_time = (api_attempt + 1) * 2  # 递增等待：2秒、4秒
-                print(f"  {'  ' * depth}⚠ API调用异常: {e}，{wait_time}秒后重试({api_attempt + 1}/{max_api_retries})...")
+        except asyncio.TimeoutError:
+            api_error_count += 1
+            if api_error_count < max_api_retries:
+                wait_time = api_error_count * 5  # 递增等待：5秒、10秒
+                print(f"  {'  ' * depth}⚠ API调用超时(120秒)，{wait_time}秒后重试({api_error_count}/{max_api_retries})...")
                 await asyncio.sleep(wait_time)
             else:
-                print(f"  {'  ' * depth}⚠ API调用异常: {e}，已达重试上限，尝试简化prompt重试...")
-                # 简化prompt重试
-                simplified_result = await _try_simplified_prompt_async(client, text, chapter_title, chunk_id, book_name)
-                if simplified_result:
-                    return simplified_result
-                print(f"  {'  ' * depth}⚠ 简化prompt重试失败，使用fallback分割")
-                _save_llm_response(chunk_id, "", book_name, chapter_title, error=str(e))
-                return _fallback_split(text)
+                # 重试都失败，直接对半拆分递归
+                print(f"  {'  ' * depth}⚠ API调用超时(120秒)，重试{max_api_retries}次都失败，对半拆分递归处理...")
+                print(f"  {'  ' * depth}📊 时间统计 - 速率限制: {total_rate_limit_time:.2f}秒, API调用: {total_api_time:.2f}秒, 解析: {total_parse_time:.3f}秒")
+                _save_llm_response(chunk_id, "", book_name, chapter_title, error="timeout")
+                return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
+        except Exception as e:
+            error_type = type(e).__name__
+            api_error_count += 1
+            if api_error_count < max_api_retries:
+                wait_time = api_error_count * 5  # 递增等待：5秒、10秒
+                print(f"  {'  ' * depth}⚠ API调用异常({error_type}): {e}，{wait_time}秒后重试({api_error_count}/{max_api_retries})...")
+                await asyncio.sleep(wait_time)
+            else:
+                # 重试都失败，直接对半拆分递归
+                print(f"  {'  ' * depth}⚠ API调用异常({error_type}): {e}，重试{max_api_retries}次都失败，对半拆分递归处理...")
+                print(f"  {'  ' * depth}📊 时间统计 - 速率限制: {total_rate_limit_time:.2f}秒, API调用: {total_api_time:.2f}秒, 解析: {total_parse_time:.3f}秒")
+                _save_llm_response(chunk_id, "", book_name, chapter_title, error=f"{error_type}: {e}")
+                return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
 
     # 理论上不会到这里，但作为保底
     return _fallback_split(text)
