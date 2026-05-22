@@ -18,6 +18,9 @@ venv/
 config/settings.json
 config/api_config.json
 
+# 主脚本（本地运行）
+audiobook_generator.py
+
 # 输出文件
 output/
 llm_raw_responses/
