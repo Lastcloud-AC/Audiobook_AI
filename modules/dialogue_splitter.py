@@ -631,20 +631,17 @@ async def _handle_moderation_split_async(
     depth: int,
     max_depth: int
 ) -> List[DialogueLine]:
-    """异步版处理内容审核拒绝的拆分（递归时使用同步调用，不占用异步并发池）"""
+    """异步版处理内容审核拒绝的拆分（递归时使用异步调用，受Semaphore控制并发）"""
     first_half, second_half = _split_text_for_moderation(text)
     print(f"  {'  ' * depth}  拆分位置: {len(first_half)}/{len(text)}字")
 
-    # 递归时使用同步客户端，避免占用异步并发池
-    sync_client = get_llm_client()
-    
-    # 顺序处理两半（同步调用）
-    first_lines = _recursive_split_by_moderation(
-        sync_client, first_half, chapter_title,
+    # 递归时使用异步客户端，受Semaphore控制并发
+    first_lines = await _recursive_split_by_moderation_async(
+        client, first_half, chapter_title,
         f"{chunk_prefix}_first", book_name, depth + 1, max_depth
     )
-    second_lines = _recursive_split_by_moderation(
-        sync_client, second_half, chapter_title,
+    second_lines = await _recursive_split_by_moderation_async(
+        client, second_half, chapter_title,
         f"{chunk_prefix}_second", book_name, depth + 1, max_depth
     )
 

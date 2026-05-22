@@ -241,13 +241,57 @@ async def generate_chapter_audio(
     # 批量生成TTS
     tts_results = await generate_tts_batch(tasks)
 
-    # 统计结果
+    # 统计结果并报告失败片段
+    tts_failed_indices = []
+    for result in tts_results:
+        if result["success"]:
+            pass  # 成功的不打印，避免刷屏
+        else:
+            error_msg = result.get("error", "未知错误")
+            tts_failed_indices.append(result["idx"] + 1)  # 转为1-based
+            print(f"      ❌ 片段 {result['idx']+1} 生成失败: {error_msg}")
+
     success_count = sum(1 for r in tts_results if r["success"])
     print(f"    ✅ TTS生成: {success_count}/{len(tasks)}段成功")
 
     # 收集成功的音频文件
     segment_files = [r["file"] for r in tts_results if r["success"]]
     segment_files.sort()
+
+    # 片段完整性校验：检查是否有缺失的片段
+    expected_count = sum(1 for line in lines if line.text.strip())
+    if len(segment_files) != expected_count:
+        print(f"    ⚠️ 片段数量不匹配: 期望{expected_count}，实际{len(segment_files)}")
+
+        # 找出缺失的片段索引
+        generated_indices = set()
+        for seg_file in segment_files:
+            # 从文件名提取索引: seg_0001.wav -> 1
+            basename = Path(seg_file).name
+            if basename.startswith("seg_") and basename.endswith(".wav"):
+                try:
+                    idx = int(basename[4:8])
+                    generated_indices.add(idx)
+                except ValueError:
+                    pass
+
+        missing_indices = []
+        missing_details = []
+        for j, line in enumerate(lines):
+            if line.text.strip() and j not in generated_indices:
+                missing_indices.append(j + 1)  # 转为1-based
+                missing_details.append(f"{j+1}[{line.character}]: {line.text[:30]}...")
+
+        if missing_indices:
+            print(f"    ❌ 缺失片段({len(missing_indices)}个): {missing_indices[:20]}{'...' if len(missing_indices) > 20 else ''}")
+            for detail in missing_details[:10]:
+                print(f"       {detail}")
+    else:
+        print(f"    ✅ 片段完整性校验通过: {len(segment_files)}/{expected_count}")
+
+    # 报告TTS失败的片段汇总
+    if tts_failed_indices:
+        print(f"    ⚠️ TTS生成失败的片段({len(tts_failed_indices)}个): {tts_failed_indices[:20]}{'...' if len(tts_failed_indices) > 20 else ''}")
 
     if not segment_files:
         print(f"    ❌ 没有生成任何音频")
