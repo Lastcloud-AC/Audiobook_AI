@@ -1,0 +1,58 @@
+{
+  "llm_api": {
+    "base_url": "https://api.mimoai.com/v1",
+    "api_key": "your_llm_api_key_here",
+    "model": "mimo-v2.5-pro"
+  },
+  "tts_api": {
+    "base_url": "https://api.mimoai.com/v1",
+    "api_key": "your_tts_api_key_here",
+    "model": "mimo-v2.5-pro"
+  },
+  "generation": {
+    "chunk_size": 1500,
+    "max_duration_per_file": 900,
+    "silence_between_segments": 0.5,
+    "silence_between_chapters": 2.0
+  },
+  "concurrency": {
+    "llm_concurrency": 3,
+    "tts_concurrency": 5
+  },
+  "rate_limit": {
+    "llm_rpm": 30,
+    "tts_rpm": 60
+  },
+  "tts": {
+    "max_chars": 300,
+    "min_chars": 2,
+    "sample_rate": 24000,
+    "channels": 1,
+    "sample_width": 2
+  },
+  "voice_presets": {
+    "冰糖": "冰糖",
+    "苏打": "苏打",
+    "茉莉": "茉莉",
+    "白桦": "白桦",
+    "Mia": "Mia",
+    "Chloe": "Chloe",
+    "Milo": "Milo",
+    "Dean": "Dean",
+    "default": "冰糖"
+  },
+  "character_voices": {
+    "旁白": "冰糖",
+    "默认": "冰糖"
+  },
+  "emotion_prompts": {
+    "neutral": "用平静自然的语气朗读",
+    "happy": "用开心愉悦的语气朗读",
+    "sad": "用悲伤低沉的语气朗读",
+    "angry": "用愤怒激动的语气朗读",
+    "fear": "用恐惧紧张的语气朗读",
+    "surprise": "用惊讶的语气朗读",
+    "disgust": "用厌恶的语气朗读",
+    "default": "用自然的语气朗读"
+  }
+}

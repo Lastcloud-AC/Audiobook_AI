@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 配置文件（包含密钥）
+config/settings.json
+config/api_config.json
+
+# 输出文件
+output/
+llm_raw_responses/
+
+# 临时文件
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# 保留示例配置
+!config/settings.example.json
