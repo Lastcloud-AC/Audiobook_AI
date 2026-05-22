@@ -107,11 +107,34 @@ def _generate_speech_impl(client: OpenAI, text: str, voice: str, emotion: str) -
             audio={"format": "wav", "voice": voice}
         )
 
+        # 检查响应
+        if not response.choices or not response.choices[0].message.audio:
+            print(f"    ❌ TTS响应无音频数据")
+            return None
+
         audio_data = response.choices[0].message.audio.data
+        if not audio_data:
+            print(f"    ❌ TTS音频数据为空")
+            return None
+
         return base64.b64decode(audio_data)
 
     except Exception as e:
-        print(f"    ❌ TTS生成失败: {e}")
+        error_type = type(e).__name__
+        error_msg = str(e)
+        
+        # 常见错误分类
+        if "content" in error_msg.lower() and ("moderation" in error_msg.lower() or "filter" in error_msg.lower()):
+            print(f"    ❌ TTS内容审核拒绝: {error_msg[:100]}")
+        elif "rate" in error_msg.lower() or "limit" in error_msg.lower():
+            print(f"    ❌ TTS速率限制: {error_msg[:100]}")
+        elif "timeout" in error_msg.lower():
+            print(f"    ❌ TTS请求超时: {error_msg[:100]}")
+        elif "auth" in error_msg.lower() or "key" in error_msg.lower():
+            print(f"    ❌ TTS认证失败: {error_msg[:100]}")
+        else:
+            print(f"    ❌ TTS生成失败({error_type}): {error_msg[:100]}")
+        
         return None
 
 
@@ -146,11 +169,34 @@ async def _generate_speech_impl_async(client: AsyncOpenAI, text: str, voice: str
             audio={"format": "wav", "voice": voice}
         )
 
+        # 检查响应
+        if not response.choices or not response.choices[0].message.audio:
+            print(f"    ❌ TTS响应无音频数据")
+            return None
+
         audio_data = response.choices[0].message.audio.data
+        if not audio_data:
+            print(f"    ❌ TTS音频数据为空")
+            return None
+
         return base64.b64decode(audio_data)
 
     except Exception as e:
-        print(f"    ❌ TTS异步生成失败: {e}")
+        error_type = type(e).__name__
+        error_msg = str(e)
+        
+        # 常见错误分类
+        if "content" in error_msg.lower() and ("moderation" in error_msg.lower() or "filter" in error_msg.lower()):
+            print(f"    ❌ TTS内容审核拒绝: {error_msg[:100]}")
+        elif "rate" in error_msg.lower() or "limit" in error_msg.lower():
+            print(f"    ❌ TTS速率限制: {error_msg[:100]}")
+        elif "timeout" in error_msg.lower():
+            print(f"    ❌ TTS请求超时: {error_msg[:100]}")
+        elif "auth" in error_msg.lower() or "key" in error_msg.lower():
+            print(f"    ❌ TTS认证失败: {error_msg[:100]}")
+        else:
+            print(f"    ❌ TTS生成失败({error_type}): {error_msg[:100]}")
+        
         return None
 
 
@@ -219,11 +265,11 @@ async def _generate_speech_with_moderation_retry_async(
         return None
 
     config = get_config()
-    min_split_length = config.generation.min_split_length
+    min_chars = config.tts.min_chars
 
     # 文本太短，放弃
-    if len(text) < min_split_length:
-        print(f"  {'  ' * depth}⚠ TTS文本过短({len(text)}字<{min_split_length})，跳过")
+    if len(text) < min_chars:
+        print(f"  {'  ' * depth}⚠ TTS文本过短({len(text)}字<{min_chars})，跳过")
         return None
 
     # 尝试生成
@@ -289,11 +335,11 @@ def _generate_speech_with_moderation_retry_sync(
         return None
 
     config = get_config()
-    min_split_length = config.generation.min_split_length
+    min_chars = config.tts.min_chars
 
     # 文本太短，放弃
-    if len(text) < min_split_length:
-        print(f"  {'  ' * depth}⚠ TTS文本过短({len(text)}字<{min_split_length})，跳过")
+    if len(text) < min_chars:
+        print(f"  {'  ' * depth}⚠ TTS文本过短({len(text)}字<{min_chars})，跳过")
         return None
 
     # 尝试生成（同步调用）
@@ -470,7 +516,14 @@ async def generate_tts_batch(tasks: List[Dict]) -> List[Dict]:
 
             if audio_bytes and save_wav(audio_bytes, output_file):
                 return {"idx": idx, "success": True, "file": output_file}
-            return {"idx": idx, "success": False, "file": output_file, "error": "生成失败或被审核拒绝"}
+            
+            # 判断失败原因
+            config = get_config()
+            if len(text) < config.tts.min_chars:
+                error_msg = f"文本过短({len(text)}字<{config.tts.min_chars})"
+            else:
+                error_msg = f"TTS生成失败(文本: {text[:20]}...)"
+            return {"idx": idx, "success": False, "file": output_file, "error": error_msg}
 
     # 并发执行所有任务
     results = await asyncio.gather(*[process_task(t) for t in tasks], return_exceptions=True)

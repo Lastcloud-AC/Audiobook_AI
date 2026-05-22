@@ -42,6 +42,8 @@ class ChapterSplitResult:
     coverage: float
     success: bool
     error: str = ""
+    start_time: float = 0.0
+    end_time: float = 0.0
 
 
 def parse_args():
@@ -95,7 +97,9 @@ async def split_chapter(
     Returns:
         章节分割结果
     """
-    print(f"  📝 章节 {chapter.number:03d}: {chapter.title} ({len(chapter.text)}字)")
+    start_time = time.time()
+    start_str = time.strftime("%H:%M:%S.") + f"{start_time % 1:.3f}"[2:]  # 毫秒级
+    print(f"  📝 [{start_str}] 章节 {chapter.number:03d}: {chapter.title} ({len(chapter.text)}字) 开始处理")
 
     try:
         lines = await split_dialogues_async(chapter.text, chapter.title, book_name)
@@ -106,7 +110,9 @@ async def split_chapter(
                 lines=[],
                 coverage=0.0,
                 success=False,
-                error="LLM返回空结果"
+                error="LLM返回空结果",
+                start_time=start_time,
+                end_time=time.time()
             )
 
         # 计算覆盖率
@@ -114,13 +120,17 @@ async def split_chapter(
         split_len = sum(len(line.text) for line in lines)
         coverage = split_len / original_len if original_len > 0 else 0
 
-        print(f"    ✅ 分割完成: {len(lines)}段, 覆盖率{coverage:.1%}")
+        elapsed = time.time() - start_time
+        end_str = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]  # 毫秒级
+        print(f"  ✅ [{end_str}] 章节 {chapter.number:03d} 分割完成: {len(lines)}段, 覆盖率{coverage:.1%} (耗时{elapsed:.1f}秒)")
 
         return ChapterSplitResult(
             chapter=chapter,
             lines=lines,
             coverage=coverage,
-            success=True
+            success=True,
+            start_time=start_time,
+            end_time=time.time()
         )
 
     except Exception as e:
@@ -130,7 +140,9 @@ async def split_chapter(
             lines=[],
             coverage=0.0,
             success=False,
-            error=str(e)
+            error=str(e),
+            start_time=start_time,
+            end_time=time.time()
         )
 
 
@@ -157,7 +169,7 @@ async def split_all_chapters(
     start_time = time.time()
     results = []
 
-    # 逐章分割（顺序执行，避免同时触发审核）
+    # 章节串行处理，块级并行在 split_dialogues_async 内部
     for chapter in chapters:
         result = await split_chapter(chapter, book_name, config)
         results.append(result)

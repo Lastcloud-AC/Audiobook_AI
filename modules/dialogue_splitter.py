@@ -224,13 +224,18 @@ async def split_dialogues_async(text: str, chapter_title: str, book_name: str) -
 def _split_dialogues_impl(client, text: str, chapter_title: str, book_name: str, is_async: bool = False) -> List[DialogueLine]:
     """分割对话的实现"""
     config = get_config()
+
+    # 第一步：按chunk_size分块（章节级别）
     chunks = _split_text_chunks(text, config.generation.chunk_size)
     all_lines = []
 
     for i, chunk in enumerate(chunks):
-        chunk_id = f"{chapter_title}_chunk{i:03d}"
-        lines = _split_single_chunk(client, chunk, chunk_id, book_name, chapter_title, is_async)
-        all_lines.extend(lines)
+        # 每个块固定分成N段（N=llm_concurrency）
+        segments = _split_fixed_segments(chunk, config.concurrency.llm_concurrency)
+        for si, segment in enumerate(segments):
+            chunk_id = f"{chapter_title}_block{i:03d}_seg{si:03d}"
+            lines = _split_single_chunk(client, segment, chunk_id, book_name, chapter_title, is_async)
+            all_lines.extend(lines)
 
     return all_lines
 
@@ -238,88 +243,121 @@ def _split_dialogues_impl(client, text: str, chapter_title: str, book_name: str,
 async def _split_dialogues_impl_async(client: AsyncOpenAI, text: str, chapter_title: str, book_name: str) -> List[DialogueLine]:
     """异步分割对话的实现"""
     config = get_config()
+
+    # 第一步：按chunk_size分块（章节级别）
     chunks = _split_text_chunks(text, config.generation.chunk_size)
 
     # 显示分块信息
     if len(chunks) > 1:
-        print(f"    📦 分为{len(chunks)}块处理:")
+        print(f"    📦 章节分为{len(chunks)}块处理:")
         for i, chunk in enumerate(chunks):
             print(f"       块{i+1}: {len(chunk)}字")
+    else:
+        print(f"    📦 章节作为1块处理: {len(chunks[0])}字")
 
     # 获取当前全局人物映射
     current_character_map = get_global_character_map()
 
-    # 并发处理所有chunks
-    semaphore = asyncio.Semaphore(config.concurrency.llm_concurrency)
-
-    async def process_chunk(i: int, chunk: str) -> List[DialogueLine]:
-        async with semaphore:
-            chunk_id = f"{chapter_title}_chunk{i:03d}"
-            start_time = time.strftime("%H:%M:%S")
-            print(f"    ⏳ [{start_time}] 块{i+1}/{len(chunks)} 开始处理 ({len(chunk)}字)")
-            result = await _split_single_chunk_async(client, chunk, chunk_id, book_name, chapter_title, current_character_map)
-            end_time = time.strftime("%H:%M:%S")
-            print(f"    ✅ [{end_time}] 块{i+1}/{len(chunks)} 处理完成: {len(result)}段")
-            return result
-
-    # 记录每个块的时间
+    # 第二步：对每个块，固定分成N段并发处理
+    all_lines = []
     chunk_times = {}
+    chapter_start = time.time()
 
-    async def process_chunk_with_time(i: int, chunk: str) -> List[DialogueLine]:
-        async with semaphore:
-            chunk_id = f"{chapter_title}_chunk{i:03d}"
-            start_time = time.time()
-            start_str = time.strftime("%H:%M:%S")
-            print(f"    ⏳ [{start_str}] 块{i+1}/{len(chunks)} 开始处理 ({len(chunk)}字)")
-            result = await _split_single_chunk_async(client, chunk, chunk_id, book_name, chapter_title, current_character_map)
-            end_time = time.time()
-            end_str = time.strftime("%H:%M:%S")
-            elapsed = end_time - start_time
-            chunk_times[i] = {"start": start_str, "end": end_str, "elapsed": elapsed}
-            print(f"    ✅ [{end_str}] 块{i+1}/{len(chunks)} 处理完成: {len(result)}段 (耗时{elapsed:.1f}秒)")
-            return result
+    for chunk_idx, chunk in enumerate(chunks):
+        # 每个块固定分成N段（N=llm_concurrency）
+        segments = _split_fixed_segments(chunk, config.concurrency.llm_concurrency)
+        seg_count = len(segments)
 
-    overall_start = time.time()
-    tasks = [process_chunk_with_time(i, chunk) for i, chunk in enumerate(chunks)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    overall_elapsed = time.time() - overall_start
+        if seg_count > 1:
+            print(f"    📦 块{chunk_idx+1}分为{seg_count}段并发处理:")
+            for si, seg in enumerate(segments):
+                print(f"       段{si+1}: {len(seg)}字")
+
+        # 并发处理这个块的所有段
+        semaphore = asyncio.Semaphore(config.concurrency.llm_concurrency)
+
+        async def process_segment(seg_idx: int, segment: str, block_idx: int, total_segs: int) -> List[DialogueLine]:
+            async with semaphore:
+                chunk_id = f"{chapter_title}_block{block_idx:03d}_seg{seg_idx:03d}"
+                start_time = time.time()
+                start_str = time.strftime("%H:%M:%S.") + f"{start_time % 1:.3f}"[2:]
+                print(f"    ⏳ [{start_str}] 块{block_idx}-段{seg_idx+1}/{total_segs} 开始处理 ({len(segment)}字)")
+                result = await _split_single_chunk_async(client, segment, chunk_id, book_name, chapter_title, current_character_map)
+                end_time = time.time()
+                end_str = time.strftime("%H:%M:%S.") + f"{end_time % 1:.3f}"[2:]
+                elapsed = end_time - start_time
+                time_key = f"block{block_idx}_seg{seg_idx}"
+                chunk_times[time_key] = {"start": start_str, "end": end_str, "elapsed": elapsed, "start_ts": start_time, "end_ts": end_time, "block": block_idx}
+                print(f"    ✅ [{end_str}] 块{block_idx}-段{seg_idx+1}/{total_segs} 处理完成: {len(result)}段 (耗时{elapsed:.1f}秒)")
+                return result
+
+        block_start = time.time()
+        tasks = [process_segment(si, seg, chunk_idx + 1, seg_count) for si, seg in enumerate(segments)]
+        seg_results = await asyncio.gather(*tasks, return_exceptions=True)
+        block_elapsed = time.time() - block_start
+
+        # 处理结果
+        for si, result in enumerate(seg_results):
+            if isinstance(result, Exception):
+                print(f"    ❌ 块{chunk_idx+1}-段{si+1} 处理失败: {str(result)[:100]}")
+            elif result:
+                all_lines.extend(result)
+
+    overall_elapsed = time.time() - chapter_start
 
     # 打印并行情况汇总
-    if len(chunks) > 1:
-        print(f"\n    📊 并行处理汇总 (总耗时{overall_elapsed:.1f}秒):")
-        print(f"    {'块':>4} | {'开始时间':>8} | {'结束时间':>8} | {'耗时':>6}")
-        print(f"    {'----':>4} | {'--------':>8} | {'--------':>8} | {'------':>6}")
-        for i in range(len(chunks)):
-            if i in chunk_times:
-                t = chunk_times[i]
-                print(f"    {i+1:>4} | {t['start']:>8} | {t['end']:>8} | {t['elapsed']:>5.1f}s")
-        # 计算并行效率
-        sum_elapsed = sum(t['elapsed'] for t in chunk_times.values())
-        if sum_elapsed > 0:
-            parallel_ratio = overall_elapsed / sum_elapsed * 100
-            print(f"    并行效率: {parallel_ratio:.0f}% (越低越好, 100%表示完全串行)")
+    print(f"\n    📊 处理汇总 (总耗时{overall_elapsed:.1f}秒, {len(chunks)}块, {len(chunk_times)}段):")
+    print(f"    {'段':>12} | {'开始时间':>12} | {'结束时间':>12} | {'耗时':>6}")
+    print(f"    {'------------':>12} | {'--------':>12} | {'--------':>12} | {'------':>6}")
+    for key in sorted(chunk_times.keys()):
+        t = chunk_times[key]
+        print(f"    {key:>12} | {t['start']:>12} | {t['end']:>12} | {t['elapsed']:>5.1f}s")
 
-    all_lines = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            print(f"    ❌ 块{i+1}处理失败: {result}")
-            # 使用fallback分割
-            all_lines.extend(_fallback_split(chunks[i]))
+    # 计算并行效率
+    sum_elapsed = sum(t['elapsed'] for t in chunk_times.values())
+    if sum_elapsed > 0:
+        parallel_ratio = overall_elapsed / sum_elapsed * 100
+        print(f"    并行效率: {parallel_ratio:.0f}% (越低越好, 100%表示完全串行)")
+
+    # 检查是否有重叠（并行证据）
+    if len(chunk_times) >= 2:
+        sorted_chunks = sorted(chunk_times.items(), key=lambda x: x[1]['start_ts'])
+        overlaps = []
+        for j in range(len(sorted_chunks) - 1):
+            idx1, t1 = sorted_chunks[j]
+            idx2, t2 = sorted_chunks[j + 1]
+            if t2['start_ts'] < t1['end_ts']:
+                overlap = t1['end_ts'] - t2['start_ts']
+                overlaps.append((idx1, idx2, overlap))
+
+        if overlaps:
+            print(f"    ✅ 检测到并行执行:")
+            for idx1, idx2, overlap in overlaps:
+                print(f"       {idx1}和{idx2}重叠 {overlap:.2f}秒")
         else:
-            all_lines.extend(result)
+            print(f"    ⚠️ 未检测到并行重叠，可能是串行执行")
 
     return all_lines
 
 
-def _split_text_chunks(text: str, chunk_size: int) -> List[str]:
+def _split_text_chunks(text: str, chunk_size: int, fixed_segments: int = 0) -> List[str]:
     """
     将文本分割成chunks
     
+    参数：
+        text: 要分割的文本
+        chunk_size: 每块最大字数（当fixed_segments=0时使用）
+        fixed_segments: 固定分段数（0表示按chunk_size分割，>0表示固定分N段）
+    
     逻辑：
-    1. 在chunk_size位置往前找100个字符内的\n\n
-    2. 找不到\n\n就找离chunk_size往前最近的\n
-    3. 确保每个块都不超过chunk_size，且尽可能接近chunk_size
+    - fixed_segments > 0: 固定分成N段，在段落边界处切割
+    - fixed_segments = 0: 按chunk_size分割，尽可能接近chunk_size
     """
+    # 固定分段模式
+    if fixed_segments > 0:
+        return _split_fixed_segments(text, fixed_segments)
+    
+    # 按chunk_size分割模式
     if len(text) <= chunk_size:
         return [text]
 
@@ -357,6 +395,54 @@ def _split_text_chunks(text: str, chunk_size: int) -> List[str]:
                 start = end
     
     return chunks
+
+
+def _split_fixed_segments(text: str, n: int) -> List[str]:
+    """
+    将文本固定分成N段，在段落边界处切割
+    
+    逻辑：
+    1. 计算每段的理想长度 = len(text) / n
+    2. 第1段：从开头到理想长度，往前找最近的\n
+    3. 第2段：从第1段结尾到理想长度*2，往前找最近的\n
+    4. 第N段：从上一段结尾到文本最后
+    
+    参数：
+        text: 要分割的文本
+        n: 固定分段数
+    """
+    if n <= 1 or len(text) <= 100:
+        return [text]
+    
+    segments = []
+    ideal_len = len(text) / n
+    start = 0
+    
+    for i in range(n - 1):  # 前n-1段需要找切割点，最后一段直接取剩余
+        target_pos = int(ideal_len * (i + 1))
+        
+        # 确保不超过文本长度
+        if target_pos >= len(text):
+            break
+        
+        # 从target_pos往前找最近的\n
+        search_start = max(start, target_pos - 200)  # 最多往前找200字
+        newline_pos = text.rfind('\n', search_start, target_pos + 100)
+        
+        if newline_pos > start:
+            # 找到了\n，在这个位置分段
+            segments.append(text[start:newline_pos])
+            start = newline_pos + 1  # 跳过\n
+        else:
+            # 找不到\n，强制在target_pos分段
+            segments.append(text[start:target_pos])
+            start = target_pos
+    
+    # 最后一段
+    if start < len(text):
+        segments.append(text[start:])
+    
+    return segments
 
 
 def _split_single_chunk(client: OpenAI, text: str, chunk_id: str, book_name: str, chapter_title: str, is_async: bool = False) -> List[DialogueLine]:
@@ -1066,6 +1152,16 @@ def _recursive_split_by_moderation(
                     return _fallback_split(text)
 
         except Exception as e:
+            error_msg = str(e).lower()
+            
+            # 超时且字数多，直接拆分（明显是字数太多导致处理慢）
+            is_timeout = "timeout" in error_msg or "timed out" in error_msg or "90" in error_msg
+            if is_timeout and len(text) > 1000:
+                print(f"  {'  ' * depth}⚠ API超时({len(text)}字>1000)，直接拆分处理...")
+                _save_llm_response(chunk_id, "", book_name, chapter_title, error=f"timeout_with_long_text({len(text)}字)")
+                return _handle_moderation_split(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
+            
+            # 其他错误，按原有逻辑重试
             if api_attempt < max_api_retries - 1:
                 wait_time = (api_attempt + 1) * 2  # 递增等待：2秒、4秒
                 print(f"  {'  ' * depth}⚠ API调用异常: {e}，{wait_time}秒后重试({api_attempt + 1}/{max_api_retries})...")
@@ -1153,7 +1249,7 @@ async def _recursive_split_by_moderation_async(
                     ],
                     temperature=0.3
                 ),
-                timeout=120  # 120秒超时（API响应较慢）
+                timeout=90  # 90秒超时
             )
             api_time = time.time() - t0
             total_api_time += api_time
@@ -1196,14 +1292,21 @@ async def _recursive_split_by_moderation_async(
                 return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
 
         except asyncio.TimeoutError:
+            # 超时且字数多，直接拆分（明显是字数太多导致处理慢）
+            if len(text) > 1000:
+                print(f"  {'  ' * depth}⚠ API超时({len(text)}字>1000)，直接拆分处理...")
+                _save_llm_response(chunk_id, "", book_name, chapter_title, error=f"timeout_with_long_text({len(text)}字)")
+                return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
+            
+            # 字数不多，按原有逻辑重试
             api_error_count += 1
             if api_error_count < max_api_retries:
                 wait_time = api_error_count * 5  # 递增等待：5秒、10秒
-                print(f"  {'  ' * depth}⚠ API调用超时(120秒)，{wait_time}秒后重试({api_error_count}/{max_api_retries})...")
+                print(f"  {'  ' * depth}⚠ API调用超时(90秒)，{wait_time}秒后重试({api_error_count}/{max_api_retries})...")
                 await asyncio.sleep(wait_time)
             else:
                 # 重试都失败，直接对半拆分递归
-                print(f"  {'  ' * depth}⚠ API调用超时(120秒)，重试{max_api_retries}次都失败，对半拆分递归处理...")
+                print(f"  {'  ' * depth}⚠ API调用超时(90秒)，重试{max_api_retries}次都失败，对半拆分递归处理...")
                 print(f"  {'  ' * depth}📊 时间统计 - 速率限制: {total_rate_limit_time:.2f}秒, API调用: {total_api_time:.2f}秒, 解析: {total_parse_time:.3f}秒")
                 _save_llm_response(chunk_id, "", book_name, chapter_title, error="timeout")
                 return await _handle_moderation_split_async(client, text, chapter_title, chunk_prefix, book_name, depth, max_depth)
