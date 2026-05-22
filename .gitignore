@@ -21,6 +21,9 @@ config/api_config.json
 # 主脚本（本地运行）
 audiobook_generator.py
 
+# 输入文件（本地测试数据）
+input/
+
 # 输出文件
 output/
 llm_raw_responses/
