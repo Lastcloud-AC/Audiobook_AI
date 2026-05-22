@@ -85,11 +85,13 @@ python scripts/generate.py input/测试短文.txt --no-skip
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `generation.chunk_size` | LLM分割的chunk大小（字符数） | 1500 |
+| `generation.chunk_size` | 按此字数分块，每块再固定分成llm_concurrency段 | 1500 |
+| `generation.min_split_length` | 递归拆分最小长度（低于此值使用fallback） | 5 |
 | `generation.max_duration_per_file` | 单个音频文件最大时长（秒） | 900 (15分钟) |
 | `generation.silence_between_segments` | 段落间静音时长（秒） | 0.5 |
-| `concurrency.llm_concurrency` | LLM并发数 | 3 |
+| `concurrency.llm_concurrency` | LLM并发数（每个块固定分成几段） | 3 |
 | `concurrency.tts_concurrency` | TTS并发数 | 5 |
+| `tts.min_chars` | TTS最小字符数（低于此值跳过） | 2 |
 | `rate_limit.llm_rpm` | LLM每分钟请求数限制 | 30 |
 | `rate_limit.tts_rpm` | TTS每分钟请求数限制 | 60 |
 
@@ -158,9 +160,10 @@ output/
 llm_raw_responses/
 └── {书名}/
     ├── chapter_001/
-    │   ├── chunk_000.json              # LLM原始响应（JSON格式）
-    │   ├── chunk_000_readable.txt      # 可读文本（方便对照检查）
-    │   └── chunk_001.json
+    │   ├── block001_seg000.json              # LLM原始响应（按块_段组织）
+    │   ├── block001_seg000_readable.txt      # 可读文本（方便对照检查）
+    │   ├── block001_seg001.json
+    │   └── ...
     └── chapter_002/
         └── ...
 ```
@@ -170,7 +173,7 @@ llm_raw_responses/
 `*_readable.txt` 文件提供清晰的对照格式：
 
 ```
-=== 第一章 相遇_chunk000 ===
+=== 第一章 相遇_block001_seg000 ===
 解析时间: 2026-05-22 12:29:30
 
 共 11 段:
@@ -204,8 +207,10 @@ llm_raw_responses/
 
 ### dialogue_splitter.py
 - 使用LLM分割对话和旁白
-- 支持异步并发处理（Semaphore控制并发数）
+- **两层分割架构**：先按 `chunk_size` 分块，再每块固定分成 `llm_concurrency` 段并发处理
+- 块内并发、块间串行：同一块的各段并发执行，块之间按顺序串行处理
 - 递归二分法处理内容审核拒绝（异步版本，不阻塞事件循环）
+- API超时90秒：超时且字数>1000字时直接拆分，不重试
 - 自动验证覆盖率（最低70%）
 - 失败时自动降级到简单分割
 
@@ -242,14 +247,28 @@ llm_raw_responses/
 ### asyncio.Lock() 错误
 已修复。使用延迟创建Lock的方案，确保绑定到正确的事件循环。
 
-### chunk并发处理被阻塞（2026-05-22修复）
-**问题**：多个chunk没有并发处理，而是顺序执行。
+### 并发架构说明（2026-05-22更新）
 
-**原因**：`_handle_moderation_split_async` 函数在遇到内容审核拒绝时，调用了同步版本的 `_recursive_split_by_moderation`，阻塞了整个事件循环。
+**两层分割架构**：
+1. **章节级**：按 `chunk_size`（默认1500字）将章节分成多个块
+2. **块级**：每个块固定分成 `llm_concurrency`（默认3）段并发处理
 
-**修复**：改为调用异步版本 `_recursive_split_by_moderation_async`，使用 `await` 等待结果。
+**执行流程**：
+```
+章节 (3000字)
+  ├── 块1 (1500字) → 段1(500字) + 段2(500字) + 段3(500字) → 并发3个
+  └── 块2 (1500字) → 段1(500字) + 段2(500字) + 段3(500字) → 并发3个
+```
 
-**效果**：chunk遇到审核拒绝时不再阻塞其他chunk的并发处理。
+**特点**：
+- 块内并发：同一块的各段使用 `asyncio.gather` 并发执行
+- 块间串行：块1完成后才处理块2
+- 章节只对音频合并有用：同一章的音频会合并成一个文件
+
+### API超时处理（2026-05-22更新）
+- API调用超时：90秒
+- 超时且字数>1000字：直接拆分，不重试（明显是字数太多导致处理慢）
+- 超时且字数≤1000字：最多重试3次（递增等待5秒、10秒）
 
 ### API连接失败
 1. 检查 `config/settings.json` 中的API配置
