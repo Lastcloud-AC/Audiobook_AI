@@ -204,7 +204,8 @@ llm_raw_responses/
 
 ### dialogue_splitter.py
 - 使用LLM分割对话和旁白
-- 支持异步并发处理
+- 支持异步并发处理（Semaphore控制并发数）
+- 递归二分法处理内容审核拒绝（异步版本，不阻塞事件循环）
 - 自动验证覆盖率（最低70%）
 - 失败时自动降级到简单分割
 
@@ -240,6 +241,15 @@ llm_raw_responses/
 
 ### asyncio.Lock() 错误
 已修复。使用延迟创建Lock的方案，确保绑定到正确的事件循环。
+
+### chunk并发处理被阻塞（2026-05-22修复）
+**问题**：多个chunk没有并发处理，而是顺序执行。
+
+**原因**：`_handle_moderation_split_async` 函数在遇到内容审核拒绝时，调用了同步版本的 `_recursive_split_by_moderation`，阻塞了整个事件循环。
+
+**修复**：改为调用异步版本 `_recursive_split_by_moderation_async`，使用 `await` 等待结果。
+
+**效果**：chunk遇到审核拒绝时不再阻塞其他chunk的并发处理。
 
 ### API连接失败
 1. 检查 `config/settings.json` 中的API配置
